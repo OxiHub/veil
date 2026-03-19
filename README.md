@@ -2,7 +2,7 @@
 
 # 🔐 Veil
 
-**End-to-end encryption for LLM inference — Signal for AI**
+**End-to-end encryption for LLM inference — An example not a working Model**
 
 [![CI](https://github.com/oxifederation/veil/actions/workflows/ci.yml/badge.svg)](https://github.com/oxifederation/veil/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
