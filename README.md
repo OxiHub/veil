@@ -22,7 +22,7 @@
 When you send a prompt to an LLM API, your request passes through:
 
 ```
-Your App → API Gateway → Load Balancer → Rate Limiter → CDN → LLM Engine
+Your App → App Server -> LLM Router(e.g OpenRouter) -> LLM Providers(AWS, Google, Azure, Oracle etc) → LLM Engine (ChatGPT, Claude, Grok etc)
 ```
 
 Every layer in that chain can read your prompts and responses in plaintext.
@@ -299,7 +299,7 @@ be dual licensed as above, without any additional terms or conditions.
 
 <div align="center">
 
-**Veil** is a project by the [Oxi Federation](https://github.com/oxifederation)
+**Veil** is a project by the [Concerned Technologist](https://github.com/oxifederation)
 
 *Protecting the confidentiality of human–AI communication*
 
