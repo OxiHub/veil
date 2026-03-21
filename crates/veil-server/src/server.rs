@@ -1,5 +1,6 @@
 //! Axum server setup and routing.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -24,15 +25,25 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         .json()
         .init();
 
-    // Load server key pair
-    let server_keypair = config
-        .load_keypair()
-        .context("Failed to load server key pair")?;
+    // Load all key pairs (primary + additional)
+    let all_keypairs = config
+        .load_all_keypairs()
+        .context("Failed to load server key pairs")?;
+
+    let mut keypairs = HashMap::new();
+    for (kid, kp) in all_keypairs {
+        info!(
+            key_id = %kid,
+            public_key = %kp.public_base64(),
+            "Loaded key pair"
+        );
+        keypairs.insert(kid, kp);
+    }
 
     info!(
-        key_id = %config.key_id,
-        public_key = %server_keypair.public_base64(),
-        "Server key pair loaded"
+        active_key_id = %config.key_id,
+        total_keys = keypairs.len(),
+        "Key pairs loaded"
     );
 
     // Build HTTP client for backend
@@ -43,12 +54,15 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         .context("Failed to build HTTP client")?;
 
     let state = Arc::new(AppState {
-        server_keypair,
+        keypairs,
+        active_key_id: config.key_id.clone(),
         backend_url: config.backend_url.clone(),
         http_client,
+        max_request_age: config.max_request_age(),
     });
 
     // Build router
+    // TODO: Add rate limiting on /v1/veil/public-key (e.g., tower_governor or custom middleware)
     let app = Router::new()
         // Veil protocol endpoints
         .route("/v1/veil/inference", post(handler::inference))
@@ -67,9 +81,10 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         .parse::<std::net::SocketAddr>()
         .context("Invalid listen address")?;
 
-    info!("🔐 Veil server listening on {}", addr);
-    info!("   Backend: {}", config.backend_url);
-    info!("   Key ID: {}", config.key_id);
+    info!(listen_addr = %addr, "Veil server listening");
+    info!(backend = %config.backend_url, "Backend URL");
+    info!(active_key = %config.key_id, "Active Key ID");
+    info!(max_age = config.max_request_age().as_secs(), "Max request age (seconds)");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

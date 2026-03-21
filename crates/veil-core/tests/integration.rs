@@ -20,8 +20,10 @@ fn test_full_e2e_roundtrip() {
     assert_eq!(metadata.token_estimate, Some(10));
     assert_eq!(metadata.key_id, "test-key");
     assert!(!metadata.ephemeral_key.is_empty());
+    assert!(!metadata.timestamp.is_empty());
+    assert!(!metadata.request_id.is_empty());
 
-    let server_session = ServerSession::new(&server_kp, &metadata.ephemeral_key)
+    let server_session = ServerSession::new(&server_kp, &metadata.ephemeral_key, "test-key")
         .expect("Failed to create server session");
 
     let decrypted = server_session
@@ -78,7 +80,7 @@ fn test_cross_session_decryption_works() {
         .expect("Failed to encrypt");
 
     // Server creates session from the ephemeral key
-    let server_session = ServerSession::new(&server_kp, &meta.ephemeral_key)
+    let server_session = ServerSession::new(&server_kp, &meta.ephemeral_key, "key-1")
         .expect("Failed to create server session");
 
     let decrypted = server_session
@@ -101,7 +103,7 @@ fn test_large_payload_e2e() {
         .encrypt_request(&large_prompt, "gpt-4-turbo", Some(50000))
         .expect("Failed to encrypt large payload");
 
-    let server_session = ServerSession::new(&server_kp, &metadata.ephemeral_key)
+    let server_session = ServerSession::new(&server_kp, &metadata.ephemeral_key, "key-1")
         .expect("Failed to create server session");
 
     let decrypted = server_session
@@ -127,7 +129,7 @@ fn test_tampered_ciphertext_rejected() {
         *byte ^= 0xFF;
     }
 
-    let server_session = ServerSession::new(&server_kp, &metadata.ephemeral_key)
+    let server_session = ServerSession::new(&server_kp, &metadata.ephemeral_key, "key-1")
         .expect("Failed to create server session");
 
     assert!(
@@ -152,7 +154,7 @@ fn test_tampered_nonce_rejected() {
         *byte ^= 0xFF;
     }
 
-    let server_session = ServerSession::new(&server_kp, &metadata.ephemeral_key)
+    let server_session = ServerSession::new(&server_kp, &metadata.ephemeral_key, "key-1")
         .expect("Failed to create server session");
 
     assert!(
@@ -173,7 +175,7 @@ fn test_wrong_server_key_rejected() {
         .encrypt_request(b"secret", "model", None)
         .expect("Failed to encrypt");
 
-    let wrong_session = ServerSession::new(&server_kp_fake, &metadata.ephemeral_key)
+    let wrong_session = ServerSession::new(&server_kp_fake, &metadata.ephemeral_key, "key-1")
         .expect("Failed to create server session");
 
     assert!(

@@ -46,6 +46,7 @@
 //! let server = ServerSession::new(
 //!     &server_kp,
 //!     &metadata.ephemeral_key,
+//!     "key-001",
 //! ).unwrap();
 //! let plaintext = server.decrypt_request(&envelope).unwrap();
 //! ```

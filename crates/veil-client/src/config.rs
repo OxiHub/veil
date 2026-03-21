@@ -19,6 +19,11 @@ pub struct ClientConfig {
 
     /// Default model to use if not specified in request.
     pub default_model: Option<String>,
+
+    /// Expected server public key for pinning verification (base64).
+    /// If set, the proxy will reject connections if the server's
+    /// public key does not match this value.
+    pub expected_server_public_key: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -29,6 +34,7 @@ impl Default for ClientConfig {
             server_public_key: String::new(),
             server_key_id: "default".to_string(),
             default_model: None,
+            expected_server_public_key: None,
         }
     }
 }

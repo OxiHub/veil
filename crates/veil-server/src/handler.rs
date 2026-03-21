@@ -1,25 +1,34 @@
 //! HTTP request handlers for the Veil decryption server.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
+use chrono::Utc;
 use serde_json::json;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use veil_core::{keys::StaticKeyPair, session::ServerSession, VeilEnvelope};
 
 use crate::metrics;
 
-/// Shared application state.
+/// Shared application state with multi-key support.
 pub struct AppState {
-    pub server_keypair: StaticKeyPair,
+    /// Map of key_id → StaticKeyPair for key rotation support.
+    pub keypairs: HashMap<String, StaticKeyPair>,
+    /// The currently active key ID served on the public-key endpoint.
+    pub active_key_id: String,
+    /// URL of the actual LLM inference backend.
     pub backend_url: String,
+    /// HTTP client for forwarding requests to the backend.
     pub http_client: reqwest::Client,
+    /// Maximum age of a request before it is rejected for replay protection.
+    pub max_request_age: Duration,
 }
 
 /// Health check endpoint.
@@ -42,12 +51,24 @@ pub async fn metrics_handler() -> impl IntoResponse {
 
 /// Public key endpoint — clients fetch this to establish sessions.
 pub async fn public_key(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({
-        "public_key": state.server_keypair.public_base64(),
-        "key_id": "default",
-        "algorithm": "X25519+HKDF-SHA256+AES-256-GCM",
-        "protocol_version": 1
-    }))
+    let active_keypair = state.keypairs.get(&state.active_key_id);
+    match active_keypair {
+        Some(kp) => Json(json!({
+            "public_key": kp.public_base64(),
+            "key_id": state.active_key_id,
+            "algorithm": "X25519+HKDF-SHA256+AES-256-GCM",
+            "protocol_version": 1
+        }))
+        .into_response(),
+        None => {
+            error!("Active key_id '{}'not found in keypairs", state.active_key_id);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Main inference endpoint — decrypt, forward, re-encrypt.
@@ -77,7 +98,64 @@ pub async fn inference(
         .unwrap_or("unknown")
         .to_string();
 
-    debug!(model = %model, "Processing Veil inference request");
+    // Extract key_id from header (defaults to active key)
+    let key_id = headers
+        .get("X-Veil-Key-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&state.active_key_id)
+        .to_string();
+
+    // Replay protection: validate timestamp
+    if let Some(ts_header) = headers.get("X-Veil-Timestamp") {
+        if let Ok(ts_str) = ts_header.to_str() {
+            match chrono::DateTime::parse_from_rfc3339(ts_str) {
+                Ok(request_time) => {
+                    let now = Utc::now();
+                    let age = now
+                        .signed_duration_since(request_time.with_timezone(&Utc))
+                        .num_seconds();
+                    if age < 0 || age > state.max_request_age.as_secs() as i64 {
+                        metrics::record_request("error");
+                        warn!(
+                            "Request timestamp too old or in future: age={}s, max={}s",
+                            age,
+                            state.max_request_age.as_secs()
+                        );
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "Request expired or invalid timestamp"})),
+                        )
+                            .into_response();
+                    }
+                }
+                Err(e) => {
+                    metrics::record_request("error");
+                    error!("Invalid timestamp format: {}", e);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "Invalid request"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    debug!(model = %model, key_id = %key_id, "Processing Veil inference request");
+
+    // Look up the keypair for the requested key_id
+    let server_keypair = match state.keypairs.get(&key_id) {
+        Some(kp) => kp,
+        None => {
+            metrics::record_request("error");
+            warn!("Unknown key_id requested: {}", key_id);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid request"})),
+            )
+                .into_response();
+        }
+    };
 
     // Parse the encrypted envelope
     let envelope = match VeilEnvelope::from_json(&body) {
@@ -87,7 +165,7 @@ pub async fn inference(
             error!("Failed to parse envelope: {}", e);
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Invalid envelope: {}", e)})),
+                Json(json!({"error": "Invalid request"})),
             )
                 .into_response();
         }
@@ -97,14 +175,14 @@ pub async fn inference(
 
     // Create server session and decrypt
     let decrypt_start = Instant::now();
-    let session = match ServerSession::new(&state.server_keypair, &ephemeral_key) {
+    let session = match ServerSession::new(server_keypair, &ephemeral_key, &key_id) {
         Ok(s) => s,
         Err(e) => {
             metrics::record_request("error");
             error!("Failed to create session: {}", e);
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Session error: {}", e)})),
+                Json(json!({"error": "Invalid request"})),
             )
                 .into_response();
         }
@@ -147,7 +225,7 @@ pub async fn inference(
             error!("Backend request failed: {}", e);
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("Backend error: {}", e)})),
+                Json(json!({"error": "Backend unavailable"})),
             )
                 .into_response();
         }
@@ -161,7 +239,7 @@ pub async fn inference(
             error!("Failed to read backend response: {}", e);
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("Backend read error: {}", e)})),
+                Json(json!({"error": "Backend unavailable"})),
             )
                 .into_response();
         }
@@ -173,10 +251,11 @@ pub async fn inference(
         let encrypt_start = Instant::now();
         let resp_envelope = match session.encrypt_response(&resp_bytes) {
             Ok(env) => env,
-            Err(_) => {
+            Err(e) => {
+                error!("Failed to encrypt backend error response: {}", e);
                 return (
                     StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": "Backend returned error and encryption failed"})),
+                    Json(json!({"error": "Internal server error"})),
                 )
                     .into_response();
             }
@@ -204,7 +283,7 @@ pub async fn inference(
             error!("Failed to encrypt response: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Response encryption failed: {}", e)})),
+                Json(json!({"error": "Internal server error"})),
             )
                 .into_response();
         }
@@ -215,9 +294,10 @@ pub async fn inference(
         Ok(j) => j,
         Err(e) => {
             metrics::record_request("error");
+            error!("Envelope serialization failed: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Envelope serialization failed: {}", e)})),
+                Json(json!({"error": "Internal server error"})),
             )
                 .into_response();
         }

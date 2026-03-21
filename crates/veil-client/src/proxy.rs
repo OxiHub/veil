@@ -12,7 +12,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use veil_core::{ClientSession, VeilEnvelope};
 
@@ -31,6 +31,16 @@ pub async fn run_proxy(config: ClientConfig) -> Result<()> {
         .parse()
         .context("Invalid listen address")?;
 
+    // Warn if public key pinning is not configured
+    if config.expected_server_public_key.is_none() {
+        warn!(
+            "No expected_server_public_key configured. \
+             Public key pinning is disabled — server key will not be verified."
+        );
+    } else {
+        info!("Public key pinning is enabled");
+    }
+
     let state = Arc::new(ProxyState {
         config,
         http_client: reqwest::Client::builder()
@@ -42,7 +52,7 @@ pub async fn run_proxy(config: ClientConfig) -> Result<()> {
         .await
         .context("Failed to bind listener")?;
 
-    info!("🔐 Veil client proxy listening on {}", addr);
+    info!(listen_addr = %addr, "Veil client proxy listening");
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -93,6 +103,16 @@ async fn process_request(
     req: Request<Incoming>,
     state: &ProxyState,
 ) -> Result<Response<Full<Bytes>>> {
+    // Verify public key pinning if configured
+    if let Some(ref expected_key) = state.config.expected_server_public_key {
+        if state.config.server_public_key != *expected_key {
+            anyhow::bail!(
+                "Server public key mismatch! Expected pinned key does not match configured key. \
+                 Possible MITM attack or misconfiguration."
+            );
+        }
+    }
+
     // Read the full request body
     let body_bytes = req
         .collect()
