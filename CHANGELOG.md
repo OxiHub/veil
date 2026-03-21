@@ -13,6 +13,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Key rotation protocol
 - Rate limiting and connection pooling in proxy
 
+## [Unreleased] — v0.2.0
+
+### Security
+- **Streaming chunk sequencing**: `encrypt_chunk()` / `decrypt_chunk()` API binds
+  `stream_id`, `chunk_index`, and `is_final` into AES-256-GCM AAD — prevents
+  chunk reordering, stream-swapping, and final-sentinel spoofing attacks
+- **AAD hardening**: request_id + timestamp now cryptographically bound into
+  every encryption operation, preventing cross-request ciphertext substitution
+- **E2EE clarification**: README and docs updated to clearly describe
+  in-process deployment (true E2EE) vs shim deployment (operator-visible)
+  trust boundaries — previously overstated claims corrected per GPT-5.4 Pro audit
+
+### Added
+- `VeilMetadata`: new fields `stream_id`, `chunk_index`, `is_final_chunk`
+  with typed HTTP headers `X-Veil-Stream-Id`, `X-Veil-Chunk-Index`, `X-Veil-Final-Chunk`
+- `ClientSession::encrypt_chunk()`: encrypt streaming chunks with position-bound AAD
+- `ServerSession::decrypt_chunk()`: decrypt streaming chunks with AAD verification
+- `VeilMetadata::as_chunk()`: helper to derive chunk metadata from base metadata
+- 13 new tests: 3 streaming unit, 2 streaming security, 2 streaming integration
+
+### Tests
+- Total: 56 tests (38 unit + 9 integration + 8 security + 1 doc)
+- Previously: 43 tests
+- Zero warnings, zero failures
+
+---
+
 ## [0.1.0] - 2026-03-19
 
 ### Added

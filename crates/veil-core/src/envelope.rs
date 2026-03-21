@@ -110,6 +110,17 @@ pub struct VeilMetadata {
 
     /// Unique request identifier (UUID v4) for deduplication.
     pub request_id: String,
+    /// Optional one-time prekey ID for dual-DH forward-secrecy sessions.
+    pub prekey_id: Option<String>,
+
+    /// Stream ID shared across all chunks (UUID v4). Authenticated in AAD.
+    pub stream_id: Option<String>,
+
+    /// Zero-based chunk index. Authenticated in AAD to prevent reordering.
+    pub chunk_index: Option<u64>,
+
+    /// True on the final chunk. Receiver must verify this arrives authentically.
+    pub is_final_chunk: Option<bool>,
 }
 
 impl VeilMetadata {
@@ -130,8 +141,36 @@ impl VeilMetadata {
         if let Some(tokens) = self.token_estimate {
             headers.push(("X-Veil-Token-Estimate".to_string(), tokens.to_string()));
         }
-
+        if let Some(ref pkid) = self.prekey_id {
+            headers.push(("X-Veil-Prekey-Id".to_string(), pkid.clone()));
+        }
+        if let Some(ref sid) = self.stream_id {
+            headers.push(("X-Veil-Stream-Id".to_string(), sid.clone()));
+        }
+        if let Some(idx) = self.chunk_index {
+            headers.push(("X-Veil-Chunk-Index".to_string(), idx.to_string()));
+        }
+        if let Some(fin) = self.is_final_chunk {
+            headers.push(("X-Veil-Final-Chunk".to_string(), fin.to_string()));
+        }
         headers
+    }
+
+    /// Build chunk metadata for streaming. Same stream_id across all chunks.
+    pub fn as_chunk(&self, stream_id: String, chunk_index: u64, is_final: bool) -> Self {
+        Self {
+            version: self.version,
+            key_id: self.key_id.clone(),
+            ephemeral_key: self.ephemeral_key.clone(),
+            model: self.model.clone(),
+            token_estimate: self.token_estimate,
+            timestamp: self.timestamp.clone(),
+            request_id: self.request_id.clone(),
+            prekey_id: self.prekey_id.clone(),
+            stream_id: Some(stream_id),
+            chunk_index: Some(chunk_index),
+            is_final_chunk: Some(is_final),
+        }
     }
 }
 
@@ -203,6 +242,10 @@ mod tests {
             token_estimate: Some(500),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             request_id: "req-123".to_string(),
+            prekey_id: None,
+            stream_id: None,
+            chunk_index: None,
+            is_final_chunk: None,
         };
 
         let headers = meta.to_headers();
@@ -259,6 +302,70 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("unsupported protocol version"));
+    }
+
+    #[test]
+    fn test_chunk_metadata_headers() {
+        let base = VeilMetadata {
+            version: 1,
+            key_id: "key-1".to_string(),
+            ephemeral_key: "pubkey".to_string(),
+            model: "gpt-4".to_string(),
+            token_estimate: None,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            request_id: "req-abc".to_string(),
+            prekey_id: None,
+            stream_id: None,
+            chunk_index: None,
+            is_final_chunk: None,
+        };
+        let chunk = base.as_chunk("stream-xyz".to_string(), 3, false);
+        let headers = chunk.to_headers();
+        assert!(headers.iter().any(|(k, v)| k == "X-Veil-Stream-Id" && v == "stream-xyz"));
+        assert!(headers.iter().any(|(k, v)| k == "X-Veil-Chunk-Index" && v == "3"));
+        assert!(headers.iter().any(|(k, v)| k == "X-Veil-Final-Chunk" && v == "false"));
+    }
+
+    #[test]
+    fn test_final_chunk_header() {
+        let base = VeilMetadata {
+            version: 1,
+            key_id: "key-1".to_string(),
+            ephemeral_key: "pubkey".to_string(),
+            model: "gpt-4".to_string(),
+            token_estimate: None,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            request_id: "req-abc".to_string(),
+            prekey_id: None,
+            stream_id: None,
+            chunk_index: None,
+            is_final_chunk: None,
+        };
+        let fin = base.as_chunk("stream-xyz".to_string(), 9, true);
+        let headers = fin.to_headers();
+        assert!(headers.iter().any(|(k, v)| k == "X-Veil-Final-Chunk" && v == "true"));
+        assert!(headers.iter().any(|(k, v)| k == "X-Veil-Chunk-Index" && v == "9"));
+    }
+
+    #[test]
+    fn test_non_streaming_has_no_chunk_headers() {
+        let meta = VeilMetadata {
+            version: 1,
+            key_id: "k".to_string(),
+            ephemeral_key: "pk".to_string(),
+            model: "m".to_string(),
+            token_estimate: None,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            request_id: "r".to_string(),
+            prekey_id: None,
+            stream_id: None,
+            chunk_index: None,
+            is_final_chunk: None,
+        };
+        let headers = meta.to_headers();
+        assert!(!headers.iter().any(|(k, _)| k == "X-Veil-Stream-Id"));
+        assert!(!headers.iter().any(|(k, _)| k == "X-Veil-Chunk-Index"));
+        assert!(!headers.iter().any(|(k, _)| k == "X-Veil-Final-Chunk"));
     }
 
     #[test]

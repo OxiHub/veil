@@ -13,9 +13,44 @@ use chrono::Utc;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
-use veil_core::{keys::StaticKeyPair, session::ServerSession, VeilEnvelope};
+use veil_core::{keys::{PreKeyPair, PreKeyBundle, StaticKeyPair}, session::ServerSession, VeilEnvelope};
 
 use crate::metrics;
+
+
+/// Thread-safe pool of one-time prekeys for true forward secrecy.
+pub struct PreKeyPool {
+    pub prekeys: std::collections::HashMap<String, PreKeyPair>,
+}
+
+impl PreKeyPool {
+    pub fn new(count: usize) -> Self {
+        let mut prekeys = std::collections::HashMap::new();
+        for _ in 0..count {
+            let pk = PreKeyPair::generate(uuid::Uuid::new_v4().to_string());
+            prekeys.insert(pk.key_id.clone(), pk);
+        }
+        Self { prekeys }
+    }
+    pub fn bundles(&self, server_static_pub: &str, server_key_id: &str) -> Vec<PreKeyBundle> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        self.prekeys.values().map(|pk| PreKeyBundle {
+            server_static_pub: server_static_pub.to_string(),
+            prekey_pub: BASE64.encode(pk.public.as_bytes()),
+            prekey_id: pk.key_id.clone(),
+            key_id: server_key_id.to_string(),
+        }).collect()
+    }
+    pub fn consume(&mut self, prekey_id: &str) -> Option<PreKeyPair> {
+        self.prekeys.remove(prekey_id)
+    }
+    pub fn replenish(&mut self, target: usize) {
+        while self.prekeys.len() < target {
+            let pk = PreKeyPair::generate(uuid::Uuid::new_v4().to_string());
+            self.prekeys.insert(pk.key_id.clone(), pk);
+        }
+    }
+}
 
 /// Shared application state with multi-key support.
 pub struct AppState {
@@ -32,6 +67,7 @@ pub struct AppState {
     /// Replay cache: tracks seen request IDs to prevent replay attacks.
     /// Maps request_id → time received. Entries expire after max_request_age.
     pub replay_cache: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    pub prekey_pool: Arc<std::sync::Mutex<PreKeyPool>>,
 }
 
 /// Health check endpoint.
@@ -72,6 +108,26 @@ pub async fn public_key(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 .into_response()
         }
     }
+}
+
+
+/// Prekey bundle endpoint for true forward secrecy.
+/// GET /v1/veil/prekeys
+pub async fn prekeys(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let active_keypair = match state.keypairs.get(&state.active_key_id) {
+        Some(kp) => kp,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Internal server error"}))) .into_response(),
+    };
+    let server_pub = active_keypair.public_base64();
+    let pool = state.prekey_pool.lock().unwrap();
+    let bundles = pool.bundles(&server_pub, &state.active_key_id);
+    let bundle_json: Vec<serde_json::Value> = bundles.iter().map(|b| json!({
+        "server_public_key": b.server_static_pub,
+        "prekey_pub": b.prekey_pub,
+        "prekey_id": b.prekey_id,
+        "server_key_id": b.key_id,
+    })).collect();
+    Json(json!({"prekeys": bundle_json, "count": bundles.len(), "algorithm": "X25519+dual-DH+HKDF-SHA256+AES-256-GCM", "protocol_version": 1})).into_response()
 }
 
 /// Main inference endpoint — decrypt, forward, re-encrypt.

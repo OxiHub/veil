@@ -12,7 +12,7 @@ use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLaye
 use tracing::info;
 
 use crate::config::ServerConfig;
-use crate::handler::{self, AppState};
+use crate::handler::{self, AppState, PreKeyPool};
 
 /// Build and start the Veil server.
 pub async fn run(config: ServerConfig) -> Result<()> {
@@ -60,6 +60,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         http_client,
         max_request_age: config.max_request_age(),
         replay_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        prekey_pool: Arc::new(std::sync::Mutex::new(PreKeyPool::new(50))),
     });
 
     // Build router
@@ -68,6 +69,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         // Veil protocol endpoints
         .route("/v1/veil/inference", post(handler::inference))
         .route("/v1/veil/public-key", get(handler::public_key))
+        .route("/v1/veil/prekeys", get(handler::prekeys))
         // Operational endpoints
         .route("/health", get(handler::health))
         .route("/metrics", get(handler::metrics_handler))

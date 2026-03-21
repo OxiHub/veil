@@ -13,7 +13,7 @@ use crate::{
     envelope::{VeilEnvelope, VeilMetadata, PROTOCOL_VERSION},
     error::{VeilError, VeilResult},
     kdf::SessionKeys,
-    keys::{parse_public_key, EphemeralKeyPair, StaticKeyPair},
+    keys::{parse_public_key, EphemeralKeyPair, PreKeyPair, StaticKeyPair},
 };
 
 /// Direction of encryption — determines which session key to use.
@@ -38,6 +38,8 @@ pub struct ClientSession {
     request_id: String,
     /// Cached timestamp for AAD binding (set on encrypt_request).
     timestamp: String,
+    /// Optional prekey ID for this session (None = standard DH, Some = dual-DH forward secrecy).
+    prekey_id: Option<String>,
 }
 
 impl ClientSession {
@@ -60,6 +62,46 @@ impl ClientSession {
             server_key_id: server_key_id.to_string(),
             request_id: String::new(),
             timestamp: String::new(),
+            prekey_id: None,
+        })
+    }
+
+
+    /// Create a client session using dual-DH for true forward secrecy.
+    ///
+    /// Uses both server static key and a one-time prekey. An attacker who later
+    /// compromises the server static key CANNOT recover session keys because the
+    /// server prekey secret is deleted after first use.
+    ///
+    /// Protocol:
+    ///   DH1 = client_eph x server_static_pub
+    ///   DH2 = client_eph x server_prekey_pub
+    ///   session_keys = HKDF(DH1 || DH2, salt="veil-e2e-llm-v2-prekey")
+    pub fn new_with_prekey(
+        server_static_b64: &str,
+        server_prekey_b64: &str,
+        server_key_id: &str,
+        prekey_id: &str,
+    ) -> VeilResult<Self> {
+        let server_static_pub = parse_public_key(server_static_b64)?;
+        let server_prekey_pub = parse_public_key(server_prekey_b64)?;
+
+        // Use StaticKeyPair as ephemeral — allows two DH ops with same key material.
+        // Cryptographically equivalent to ephemeral: fresh random key, single session.
+        let client_eph = StaticKeyPair::generate();
+        let ephemeral_public = *client_eph.public_key();
+
+        let static_shared = client_eph.diffie_hellman(&server_static_pub);
+        let prekey_shared = client_eph.diffie_hellman(&server_prekey_pub);
+        let session_keys = SessionKeys::derive_with_prekey(&static_shared, &prekey_shared)?;
+
+        Ok(Self {
+            session_keys,
+            ephemeral_public,
+            server_key_id: server_key_id.to_string(),
+            request_id: String::new(),
+            timestamp: String::new(),
+            prekey_id: Some(prekey_id.to_string()),
         })
     }
 
@@ -92,6 +134,10 @@ impl ClientSession {
             token_estimate,
             timestamp,
             request_id,
+            prekey_id: self.prekey_id.clone(),
+            stream_id: None,
+            chunk_index: None,
+            is_final_chunk: None,
         };
 
         Ok((envelope, metadata))
@@ -114,6 +160,53 @@ impl ClientSession {
             &envelope.ciphertext,
             &envelope.aad,
         )
+    }
+
+    /// Encrypt a streaming chunk with authenticated stream position.
+    ///
+    /// The stream_id and chunk_index are bound into the AAD so that:
+    /// - Chunks cannot be reordered (different chunk_index = different AAD = auth failure)
+    /// - Chunks from stream A cannot replace chunks from stream B (stream_id in AAD)
+    /// - The final sentinel chunk is cryptographically bound to is_final=true
+    pub fn encrypt_chunk(
+        &mut self,
+        plaintext: &[u8],
+        model: &str,
+        stream_id: &str,
+        chunk_index: u64,
+        is_final: bool,
+    ) -> VeilResult<(VeilEnvelope, VeilMetadata)> {
+        use chrono::Utc;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let timestamp = Utc::now().to_rfc3339();
+        // Bind request_id and timestamp into self BEFORE build_aad() — same pattern as encrypt_request()
+        self.request_id = request_id.clone();
+        self.timestamp = timestamp.clone();
+        // Extended AAD includes stream_id + chunk_index + is_final for stream binding
+        let base_aad = self.build_aad(Direction::ClientToServer);
+        let extended_aad = format!(
+            "{}-stream-{}-chunk-{}-final-{}",
+            String::from_utf8_lossy(&base_aad),
+            stream_id, chunk_index, is_final
+        ).into_bytes();
+        let (nonce, ciphertext) =
+            cipher::encrypt(&self.session_keys.client_to_server, plaintext, &extended_aad)?;
+        let envelope = VeilEnvelope::new(nonce, ciphertext, extended_aad);
+        let base_meta = VeilMetadata {
+            version: PROTOCOL_VERSION,
+            key_id: self.server_key_id.clone(),
+            ephemeral_key: BASE64.encode(self.ephemeral_public.as_bytes()),
+            model: model.to_string(),
+            token_estimate: None,
+            timestamp,
+            request_id,
+            prekey_id: self.prekey_id.clone(),
+            stream_id: None,
+            chunk_index: None,
+            is_final_chunk: None,
+        };
+        let chunk_meta = base_meta.as_chunk(stream_id.to_string(), chunk_index, is_final);
+        Ok((envelope, chunk_meta))
     }
 
     /// Get the ephemeral public key (base64) for the handshake.
@@ -180,6 +273,35 @@ impl ServerSession {
         })
     }
 
+
+    /// Create a server session using dual-DH with a one-time prekey.
+    ///
+    /// The prekey secret is used for DH then zeroized on drop.
+    /// Remove the prekey from the pool after calling this method.
+    pub fn new_with_prekey(
+        server_keypair: &StaticKeyPair,
+        server_prekey: &PreKeyPair,
+        client_ephemeral_b64: &str,
+        key_id: &str,
+        request_id: &str,
+        timestamp: &str,
+    ) -> VeilResult<Self> {
+        let client_public = parse_public_key(client_ephemeral_b64)?;
+
+        // Mirror client dual-DH: DH1 = server_static x client_eph, DH2 = server_prekey x client_eph
+        let static_shared = server_keypair.diffie_hellman(&client_public);
+        let prekey_shared = server_prekey.diffie_hellman(&client_public);
+        let session_keys = SessionKeys::derive_with_prekey(&static_shared, &prekey_shared)?;
+
+        Ok(Self {
+            session_keys,
+            key_id: key_id.to_string(),
+            ephemeral_public_b64: client_ephemeral_b64.to_string(),
+            request_id: request_id.to_string(),
+            timestamp: timestamp.to_string(),
+        })
+    }
+
     /// Decrypt a client request (client→server).
     pub fn decrypt_request(&self, envelope: &VeilEnvelope) -> VeilResult<Vec<u8>> {
         let expected_aad = self.build_aad(Direction::ClientToServer);
@@ -190,6 +312,37 @@ impl ServerSession {
             ));
         }
 
+        cipher::decrypt(
+            &self.session_keys.client_to_server,
+            &envelope.nonce,
+            &envelope.ciphertext,
+            &envelope.aad,
+        )
+    }
+
+    /// Decrypt a streaming chunk from client, verifying stream position binding.
+    ///
+    /// The stream_id, chunk_index, and is_final must exactly match what the client
+    /// used in encrypt_chunk(). Any mismatch causes AES-256-GCM auth failure,
+    /// detecting chunk reordering, stream swapping, or final-sentinel tampering.
+    pub fn decrypt_chunk(
+        &self,
+        envelope: &VeilEnvelope,
+        stream_id: &str,
+        chunk_index: u64,
+        is_final: bool,
+    ) -> VeilResult<Vec<u8>> {
+        let base_aad = self.build_aad(Direction::ClientToServer);
+        let expected_aad = format!(
+            "{}-stream-{}-chunk-{}-final-{}",
+            String::from_utf8_lossy(&base_aad),
+            stream_id, chunk_index, is_final
+        ).into_bytes();
+        if envelope.aad != expected_aad {
+            return Err(VeilError::Decryption(
+                "Chunk AAD mismatch â stream_id, chunk_index, or is_final tampered".into(),
+            ));
+        }
         cipher::decrypt(
             &self.session_keys.client_to_server,
             &envelope.nonce,
@@ -358,6 +511,110 @@ mod tests {
         // Verify the timestamp is valid ISO 8601
         let parsed = chrono::DateTime::parse_from_rfc3339(&metadata.timestamp);
         assert!(parsed.is_ok(), "Timestamp should be valid RFC 3339/ISO 8601");
+    }
+
+
+    #[test]
+    fn test_prekey_roundtrip_true_forward_secrecy() {
+        use crate::keys::PreKeyPair;
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        let server_static = StaticKeyPair::generate();
+        let server_prekey = PreKeyPair::generate("prekey-001".into());
+        let prekey_pub_b64 = BASE64.encode(server_prekey.public.as_bytes());
+
+        let mut client_session = ClientSession::new_with_prekey(
+            &server_static.public_base64(),
+            &prekey_pub_b64,
+            "key-001",
+            &server_prekey.key_id,
+        ).unwrap();
+
+        assert_eq!(client_session.prekey_id, Some("prekey-001".into()));
+
+        let prompt = b"Confidential prompt with true forward secrecy";
+        let (envelope, metadata) = client_session
+            .encrypt_request(prompt, "gpt-4", Some(10))
+            .unwrap();
+
+        assert_eq!(metadata.prekey_id, Some("prekey-001".into()));
+
+        let server_session = ServerSession::new_with_prekey(
+            &server_static,
+            &server_prekey,
+            &metadata.ephemeral_key,
+            "key-001",
+            &metadata.request_id,
+            &metadata.timestamp,
+        ).unwrap();
+
+        let decrypted = server_session.decrypt_request(&envelope).unwrap();
+        assert_eq!(decrypted, prompt);
+
+        let response = b"Confidential response";
+        let resp_envelope = server_session.encrypt_response(response).unwrap();
+        let decrypted_resp = client_session.decrypt_response(&resp_envelope).unwrap();
+        assert_eq!(decrypted_resp, response);
+    }
+
+    #[test]
+    fn test_prekey_and_standard_sessions_incompatible() {
+        use crate::keys::PreKeyPair;
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        let server_static = StaticKeyPair::generate();
+        let server_prekey = PreKeyPair::generate("prekey-002".into());
+        let prekey_pub_b64 = BASE64.encode(server_prekey.public.as_bytes());
+
+        let mut client_prekey = ClientSession::new_with_prekey(
+            &server_static.public_base64(),
+            &prekey_pub_b64,
+            "key-001",
+            &server_prekey.key_id,
+        ).unwrap();
+
+        let (envelope, metadata) = client_prekey
+            .encrypt_request(b"prekey secret", "gpt-4", None)
+            .unwrap();
+
+        // Standard session MUST NOT decrypt prekey-encrypted traffic
+        let standard_session = ServerSession::new(
+            &server_static,
+            &metadata.ephemeral_key,
+            "key-001",
+            &metadata.request_id,
+            &metadata.timestamp,
+        ).unwrap();
+
+        assert!(
+            standard_session.decrypt_request(&envelope).is_err(),
+            "Standard session must NOT decrypt prekey-encrypted traffic"
+        );
+    }
+
+    #[test]
+    fn test_prekey_metadata_header_present() {
+        use crate::keys::PreKeyPair;
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        let server_kp = StaticKeyPair::generate();
+        let prekey = PreKeyPair::generate("pk-header-test".into());
+        let mut client_session = ClientSession::new_with_prekey(
+            &server_kp.public_base64(),
+            &BASE64.encode(prekey.public.as_bytes()),
+            "key-001",
+            &prekey.key_id,
+        ).unwrap();
+
+        let (_, metadata) = client_session
+            .encrypt_request(b"test", "gpt-4", None)
+            .unwrap();
+
+        let headers = metadata.to_headers();
+        assert!(
+            headers.iter().any(|(k, v)| k == "X-Veil-Prekey-Id" && v == "pk-header-test"),
+            "X-Veil-Prekey-Id header must be present in prekey sessions"
+        );
     }
 
     #[test]

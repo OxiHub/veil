@@ -2177,6 +2177,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "chrono",
  "prometheus",
  "reqwest",
@@ -2188,6 +2189,7 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "veil-core",
 ]
 

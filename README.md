@@ -44,11 +44,59 @@ When veil-server runs in-process with the LLM engine, only your application and 
        └──── 🔓 Decrypted Response ◀── 🔒 ◀── 🔒 ◀─────┘
 ```
 
-**Veil is inspired by Signal's approach to messaging** — applying the same principle
-of application-layer encryption to LLM inference traffic, so middleware sees only
-opaque encrypted blobs regardless of the transport.
+**Veil is inspired by Signal's principle of application-layer encryption** —
+applying the same idea to LLM inference traffic so that middleware sees only
+opaque encrypted blobs regardless of the transport layer.
+
+> **Trust boundary:** When `veil-server` runs **in-process** with the LLM engine,
+> this is true end-to-end encryption — only your app and the inference engine can read content.
+> When deployed as a sidecar, it is application-layer encryption terminating at the shim operator.
+> See [Deployment Modes](#deployment-modes) for guidance.
 
 ---
+
+
+## Deployment Modes
+
+Veil supports two deployment modes with different trust guarantees:
+
+### Mode 1: In-Process (True E2EE) ✅
+
+Link `veil-server` directly into your LLM inference process (e.g., as a library
+embedded in llama.cpp, vLLM, Ollama, or a custom inference server):
+
+```
+Your App → [Encrypted] → Network → [Encrypted] → LLM Process
+                                                      └── veil-server (decrypts)
+                                                      └── Inference Engine (reads plaintext)
+```
+
+**Trust guarantee:** No party between your app and the inference engine can read content.
+This is true end-to-end encryption.
+
+### Mode 2: Sidecar Shim (Application-Layer Encryption)
+
+Run `veil-server` as a separate process in front of a third-party LLM API:
+
+```
+Your App → [Encrypted] → veil-server (decrypts) → LLM API (plaintext)
+```
+
+**Trust guarantee:** Encryption protects traffic from your app to the shim.
+The shim operator and LLM provider can still read plaintext. Choose this mode
+when you control and trust the shim deployment environment.
+
+### Prekey Endpoint (True Forward Secrecy)
+
+Fetch one-time server prekeys before establishing a session:
+
+```bash
+curl http://localhost:8481/v1/veil/prekeys
+```
+
+Use the returned `prekey_pub` + `prekey_id` in `ClientSession::new_with_prekey()`.
+The server deletes the prekey secret after first use — compromising the server
+static key later **cannot** retroactively decrypt sessions that used prekeys.
 
 ## Quick Start
 
@@ -119,11 +167,12 @@ For full E2EE, deploy veil-server in-process with your LLM inference engine (see
 
 | Stage | Algorithm | Purpose |
 |-------|-----------|:--------|
-| Key Exchange | X25519 ECDH | Establish shared secret; client-side forward secrecy via ephemeral keys |
+| Key Exchange | X25519 ECDH | Establish shared secret; true forward secrecy via ephemeral client + one-time server prekeys |
 | Key Derivation | HKDF-SHA256 | Derive directional encryption keys |
 | Encryption | AES-256-GCM | Authenticated encryption of prompts/responses |
 
-Every request uses a **fresh client ephemeral key**, providing **client-side forward secrecy** —
+Every request uses a **fresh client ephemeral key** combined with a **one-time server prekey**,
+providing **true forward secrecy** —
 compromising the server key does not reveal past conversations.
 
 📖 **Full protocol specification** → [ARCHITECTURE.md](ARCHITECTURE.md)
@@ -133,14 +182,14 @@ compromising the server key does not reveal past conversations.
 ## Features
 
 - 🔒 **End-to-end encryption** — prompts and responses encrypted through all middleware
-- 🔑 **Client-side forward secrecy** — fresh ephemeral keys per request (server prekeys roadmapped for v0.2)
+- 🔑 **True forward secrecy** — fresh client ephemeral + one-time server prekeys (`GET /v1/veil/prekeys`); server prekey secrets deleted after first use
 - 🛡️ **Authenticated encryption** — AES-256-GCM detects any tampering
 - 🔄 **Drop-in proxy mode** — zero changes to existing OpenAI-compatible apps
 - ⚡ **Minimal overhead** — ~48 bytes per message, sub-millisecond crypto
 - 📦 **Pure Rust** — memory-safe, no unsafe code in core
 - 🧹 **Zeroize-on-drop** — key material scrubbed from memory after use
 - 🐳 **Docker ready** — multi-stage builds for client and server
-- 🧪 **Thoroughly tested** — 36 tests covering crypto, integration, and security properties
+- 🧪 **Thoroughly tested** — 49 tests covering crypto, integration, and security properties
 
 ---
 

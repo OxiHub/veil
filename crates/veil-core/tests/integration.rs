@@ -183,3 +183,58 @@ fn test_wrong_server_key_rejected() {
         "Wrong server key should fail to decrypt"
     );
 }
+
+#[test]
+fn test_encrypt_decrypt_chunk_roundtrip() {
+    // Full roundtrip: client encrypt_chunk -> server decrypt_chunk
+    // Verifies the streaming API pair is symmetric and correct.
+    let server_kp = veil_core::keys::StaticKeyPair::generate();
+    let server_pub = server_kp.public_base64();
+    let mut client = veil_core::session::ClientSession::new(&server_pub, "key-1").unwrap();
+    let plaintext = b"streaming chunk content";
+    let stream_id = "stream-abc-123";
+    let chunk_index = 5u64;
+    let is_final = false;
+    // Client encrypts chunk
+    let (envelope, meta) = client
+        .encrypt_chunk(plaintext, "gpt-4", stream_id, chunk_index, is_final)
+        .expect("encrypt_chunk failed");
+    // Verify metadata fields are set correctly
+    assert_eq!(meta.stream_id.as_deref(), Some(stream_id));
+    assert_eq!(meta.chunk_index, Some(chunk_index));
+    assert_eq!(meta.is_final_chunk, Some(is_final));
+    // Server creates session from client metadata
+    let server = veil_core::session::ServerSession::new(
+        &server_kp,
+        &meta.ephemeral_key,
+        &meta.key_id,
+        &meta.request_id,
+        &meta.timestamp,
+    ).expect("ServerSession::new failed");
+    // Server decrypts chunk with correct stream position
+    let decrypted = server
+        .decrypt_chunk(&envelope, stream_id, chunk_index, is_final)
+        .expect("decrypt_chunk failed");
+    assert_eq!(decrypted, plaintext);
+}
+
+#[test]
+fn test_decrypt_chunk_rejects_wrong_index() {
+    // Server must reject chunk with wrong chunk_index (reorder attack).
+    let server_kp = veil_core::keys::StaticKeyPair::generate();
+    let server_pub = server_kp.public_base64();
+    let mut client = veil_core::session::ClientSession::new(&server_pub, "key-1").unwrap();
+    let (envelope, meta) = client
+        .encrypt_chunk(b"chunk at index 0", "gpt-4", "stream-1", 0, false)
+        .expect("encrypt failed");
+    let server = veil_core::session::ServerSession::new(
+        &server_kp,
+        &meta.ephemeral_key,
+        &meta.key_id,
+        &meta.request_id,
+        &meta.timestamp,
+    ).expect("server session failed");
+    // Attempt to decrypt as chunk index 1 (wrong!) must fail
+    let result = server.decrypt_chunk(&envelope, "stream-1", 1, false);
+    assert!(result.is_err(), "Should reject chunk with wrong index — reorder attack detected");
+}

@@ -133,6 +133,66 @@ pub fn parse_public_key(b64: &str) -> VeilResult<PublicKey> {
     Ok(PublicKey::from(arr))
 }
 
+
+
+/// A one-time prekey pair for true forward secrecy.
+/// Server generates a pool of these; each is used exactly once then deleted.
+/// Compromise of the server static key after session completion cannot
+/// recover prekey secrets (already deleted) → true forward secrecy.
+#[derive(ZeroizeOnDrop)]
+pub struct PreKeyPair {
+    secret: StaticSecret,
+    #[zeroize(skip)]
+    pub public: PublicKey,
+    #[zeroize(skip)]
+    pub key_id: String,
+}
+
+impl PreKeyPair {
+    /// Generate a new random one-time prekey pair with given ID.
+    pub fn generate(key_id: String) -> Self {
+        let secret = StaticSecret::random_from_rng(OsRng);
+        let public = PublicKey::from(&secret);
+        Self { secret, public, key_id }
+    }
+
+    /// Perform ECDH with a peer public key, consuming the prekey secret.
+    pub fn diffie_hellman(&self, peer_public: &PublicKey) -> SharedSecret {
+        self.secret.diffie_hellman(peer_public)
+    }
+
+    /// Export public key as base64.
+    pub fn public_base64(&self) -> String {
+        BASE64.encode(self.public.as_bytes())
+    }
+}
+
+/// A prekey bundle sent from server to client.
+/// Contains the server static public key and a one-time prekey public key.
+/// Client uses both to derive a session key with true forward secrecy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreKeyBundle {
+    /// Base64-encoded server static public key.
+    pub server_static_pub: String,
+    /// Base64-encoded one-time prekey public key.
+    pub prekey_pub: String,
+    /// Unique ID of this one-time prekey (server uses to look up and delete secret).
+    pub prekey_id: String,
+    /// Key ID of the server static key.
+    pub key_id: String,
+}
+
+impl PreKeyBundle {
+    /// Parse the server static public key.
+    pub fn parse_server_static(&self) -> VeilResult<PublicKey> {
+        parse_public_key(&self.server_static_pub)
+    }
+
+    /// Parse the one-time prekey public key.
+    pub fn parse_prekey(&self) -> VeilResult<PublicKey> {
+        parse_public_key(&self.prekey_pub)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

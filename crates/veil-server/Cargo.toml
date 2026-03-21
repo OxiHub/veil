@@ -35,5 +35,8 @@ toml = "0.8"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
 # Metrics
 prometheus = "0.13"
