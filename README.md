@@ -255,7 +255,7 @@ Veil takes security seriously:
 
 **Do NOT open a public issue for security vulnerabilities.**
 
-Please email security@oxifederation.com with:
+Please email aehthesham.gom@gmail.com with:
 - Description of the vulnerability
 - Steps to reproduce
 - Potential impact assessment

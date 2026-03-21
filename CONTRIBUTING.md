@@ -341,7 +341,7 @@ pub fn encrypt(plaintext: &[u8], key: &[u8; 32], aad: &[u8]) -> Result<...> {
 
 If you discover a security vulnerability, please report it responsibly:
 
-1. **Email**: security@oxifederation.com
+1. **Email**: aehthesham.gom@gmail.com
 2. **Include**:
    - Description of the vulnerability
    - Steps to reproduce
