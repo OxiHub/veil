@@ -65,3 +65,5 @@ venv/
 .Trashes
 ehthumbs.db
 .github/
+docs/gpt54pro_validation_playbook.md
+scripts/gpt54pro_validator.py
